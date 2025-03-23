@@ -1,0 +1,559 @@
+****BACKEND PROGRAMMING****
+{
+  "name": "quiz-maker-backend",
+  "version": "1.0.0",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "cors": "^2.8.5",
+    "express": "^4.17.1",
+    "jsonwebtoken": "^8.5.1",
+    "mongoose": "^5.12.7"
+  }
+}
+const express = require('express');
+const mongoose = require('mongoose');
+const cors = require('cors');
+
+const authRoutes = require('./routes/auth');
+const quizRoutes = require('./routes/quizzes');
+
+const app = express();
+
+// Middleware
+app.use(cors());
+app.use(express.json());
+
+// Connect to MongoDB (adjust the URI as necessary)
+mongoose
+  .connect('mongodb://localhost/quiz-maker', {
+    useNewUrlParser: true,
+    useUnifiedTopology: true
+  })
+  .then(() => console.log('MongoDB connected'))
+  .catch((err) => console.error(err));
+
+// API Routes
+app.use('/api/auth', authRoutes);
+app.use('/api/quizzes', quizRoutes);
+
+// Start the server
+const PORT = process.env.PORT || 5000;
+app.listen(PORT, () => console.log(`Server started on port ${PORT}`));
+const jwt = require('jsonwebtoken');
+const JWT_SECRET = 'your_jwt_secret'; // Replace with a strong secret key and store securely
+
+module.exports = function (req, res, next) {
+  const token = req.header('Authorization');
+  if (!token) {
+    return res.status(401).json({ error: 'No token, authorization denied' });
+  }
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    req.user = decoded;
+    next();
+  } catch (err) {
+    res.status(401).json({ error: 'Token is not valid' });
+  }
+};
+const mongoose = require('mongoose');
+const bcrypt = require('bcryptjs');
+
+const UserSchema = new mongoose.Schema({
+  username: { type: String, unique: true, required: true },
+  password: { type: String, required: true },
+  isExaminer: { type: Boolean, default: false }
+});
+
+// Automatically hash password before saving
+UserSchema.pre('save', async function (next) {
+  if (!this.isModified('password')) return next();
+  try {
+    const salt = await bcrypt.genSalt(10);
+    this.password = await bcrypt.hash(this.password, salt);
+    next();
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Compare password method
+UserSchema.methods.comparePassword = async function (candidatePassword) {
+  return bcrypt.compare(candidatePassword, this.password);
+};
+
+module.exports = mongoose.model('User', UserSchema);
+const mongoose = require('mongoose');
+
+const QuestionSchema = new mongoose.Schema({
+  question: { type: String, required: true },
+  options: [{ type: String, required: true }],
+  answerIndex: { type: Number, required: true }
+});
+
+const QuizSchema = new mongoose.Schema({
+  title: { type: String, required: true },
+  examiner: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+  questions: [QuestionSchema],
+  analytics: {
+    attempts: { type: Number, default: 0 },
+    averageScore: { type: Number, default: 0 }
+  }
+});
+
+module.exports = mongoose.model('Quiz', QuizSchema);
+const express = require('express');
+const router = express.Router();
+const User = require('../models/User');
+const jwt = require('jsonwebtoken');
+
+const JWT_SECRET = 'your_jwt_secret'; // same secret key as in authenticate.js
+
+// Register a new user
+router.post('/register', async (req, res) => {
+  const { username, password, isExaminer } = req.body;
+  try {
+    const user = new User({ username, password, isExaminer });
+    await user.save();
+    res.status(201).json({ message: 'User created successfully' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Login existing user
+router.post('/login', async (req, res) => {
+  const { username, password } = req.body;
+  try {
+    const user = await User.findOne({ username });
+    if (!user) return res.status(400).json({ error: 'Invalid credentials' });
+
+    const isMatch = await user.comparePassword(password);
+    if (!isMatch) return res.status(400).json({ error: 'Invalid credentials' });
+
+    const token = jwt.sign(
+      { id: user._id, isExaminer: user.isExaminer },
+      JWT_SECRET,
+      { expiresIn: '1h' }
+    );
+    res.json({ token });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+module.exports = router;
+const express = require('express');
+const router = express.Router();
+const Quiz = require('../models/Quiz');
+const authenticate = require('../middleware/authenticate');
+
+// Create a new quiz (only examiners can create)
+router.post('/', authenticate, async (req, res) => {
+  if (!req.user.isExaminer) {
+    return res.status(403).json({ error: 'Forbidden: Only examiners can create quizzes' });
+  }
+  
+  const { title, questions } = req.body;
+  try {
+    const quiz = new Quiz({ title, questions, examiner: req.user.id });
+    await quiz.save();
+    res.status(201).json(quiz);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Get list of all quizzes
+router.get('/', async (req, res) => {
+  try {
+    const quizzes = await Quiz.find().populate('examiner', 'username');
+    res.json(quizzes);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Attempt a quiz (calculate score and update simple analytics)
+router.post('/:quizId/attempt', async (req, res) => {
+  try {
+    const quiz = await Quiz.findById(req.params.quizId);
+    if (!quiz) return res.status(404).json({ error: 'Quiz not found' });
+      
+    const { answers } = req.body; // Array of chosen option indices
+    let score = 0;
+    
+    quiz.questions.forEach((question, index) => {
+      if (answers[index] === question.answerIndex) {
+        score++;
+      }
+    });
+    
+    // Update quiz analytics
+    quiz.analytics.attempts += 1;
+    quiz.analytics.averageScore =
+      ((quiz.analytics.averageScore * (quiz.analytics.attempts - 1)) + score) /
+      quiz.analytics.attempts;
+    
+    await quiz.save();
+    res.json({ score, total: quiz.questions.length });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Simple leaderboard endpoint (for demonstration)
+router.get('/:quizId/leaderboard', async (req, res) => {
+  try {
+    const quiz = await Quiz.findById(req.params.quizId).populate('examiner', 'username');
+    if (!quiz) return res.status(404).json({ error: 'Quiz not found' });
+    
+    // A real leaderboard would aggregate multiple attempt scores.
+    // Here, we simply return the examiner and the average score.
+    res.json({
+      leaderboard: [{
+        examiner: quiz.examiner.username,
+        averageScore: quiz.analytics.averageScore
+      }]
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+module.exports = router;
+*****FRONTEND PROGRAMMING*****
+{
+  "name": "quiz-maker-frontend",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "axios": "^0.21.1",
+    "react": "^17.0.2",
+    "react-dom": "^17.0.2",
+    "react-router-dom": "^5.2.0"
+  },
+  "scripts": {
+    "start": "react-scripts start",
+    "build": "react-scripts build"
+  }
+}
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Online Quiz Maker</title>
+  </head>
+  <body>
+    <div id="root"></div>
+  </body>
+</html>
+import React from 'react';
+import ReactDOM from 'react-dom';
+import App from './App';
+
+ReactDOM.render(<App />, document.getElementById('root'));
+import React from 'react';
+import { BrowserRouter as Router, Switch, Route, Link } from 'react-router-dom';
+import Login from './components/Login';
+import QuizList from './components/QuizList';
+import CreateQuiz from './components/CreateQuiz';
+import QuizAttempt from './components/QuizAttempt';
+
+function App() {
+  return (
+    <Router>
+      <div style={{ margin: "20px" }}>
+        <nav>
+          <Link to="/">Quizzes</Link> |{' '}
+          <Link to="/login">Login / Register</Link> |{' '}
+          <Link to="/create">Create Quiz</Link>
+        </nav>
+        <hr />
+        <Switch>
+          <Route path="/" exact component={QuizList} />
+          <Route path="/login" component={Login} />
+          <Route path="/create" component={CreateQuiz} />
+          <Route path="/quiz/:quizId" component={QuizAttempt} />
+        </Switch>
+      </div>
+    </Router>
+  );
+}
+
+export default App;
+import React, { useState } from 'react';
+import axios from 'axios';
+
+function Login({ history }) {
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+  const [isExaminer, setIsExaminer] = useState(false);
+
+  const handleLogin = async (e) => {
+    e.preventDefault();
+    try {
+      const res = await axios.post('http://localhost:5000/api/auth/login', { username, password });
+      localStorage.setItem('token', res.data.token);
+      history.push('/');
+    } catch (err) {
+      console.error(err);
+      alert('Login failed');
+    }
+  };
+
+  const handleRegister = async (e) => {
+    e.preventDefault();
+    try {
+      await axios.post('http://localhost:5000/api/auth/register', { username, password, isExaminer });
+      alert('Registration successful! Please login.');
+    } catch (err) {
+      console.error(err);
+      alert('Registration failed');
+    }
+  };
+
+  return (
+    <div>
+      <h2>Login / Register</h2>
+      <form onSubmit={handleLogin}>
+        <label>Username:</label><br />
+        <input
+          type="text"
+          value={username}
+          onChange={(e) => setUsername(e.target.value)}
+          required
+        /><br /><br />
+        <label>Password:</label><br />
+        <input
+          type="password"
+          value={password}
+          onChange={(e) => setPassword(e.target.value)}
+          required
+        /><br /><br />
+        <label>
+          Examiner?
+          <input
+            type="checkbox"
+            checked={isExaminer}
+            onChange={(e) => setIsExaminer(e.target.checked)}
+          />
+        </label><br /><br />
+        <button type="submit">Login</button>
+        <button onClick={handleRegister} style={{ marginLeft: "10px" }}>Register</button>
+      </form>
+    </div>
+  );
+}
+
+export default Login;
+import React, { useEffect, useState } from 'react';
+import axios from 'axios';
+import { Link } from 'react-router-dom';
+
+function QuizList() {
+  const [quizzes, setQuizzes] = useState([]);
+
+  useEffect(() => {
+    axios.get('http://localhost:5000/api/quizzes')
+      .then((res) => setQuizzes(res.data))
+      .catch((err) => console.error(err));
+  }, []);
+
+  return (
+    <div>
+      <h2>Available Quizzes</h2>
+      <ul>
+        {quizzes.map((quiz) => (
+          <li key={quiz._id}>
+            <Link to={`/quiz/${quiz._id}`}>{quiz.title}</Link>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+export default QuizList;
+import React, { useState } from 'react';
+import axios from 'axios';
+
+function CreateQuiz({ history }) {
+  const [title, setTitle] = useState("");
+  const [questions, setQuestions] = useState([
+    { question: "", options: ["", "", "", ""], answerIndex: 0 }
+  ]);
+
+  const handleQuestionChange = (index, value) => {
+    const newQuestions = [...questions];
+    newQuestions[index].question = value;
+    setQuestions(newQuestions);
+  };
+
+  const handleOptionChange = (qIndex, oIndex, value) => {
+    const newQuestions = [...questions];
+    newQuestions[qIndex].options[oIndex] = value;
+    setQuestions(newQuestions);
+  };
+
+  const handleAnswerChange = (qIndex, value) => {
+    const newQuestions = [...questions];
+    newQuestions[qIndex].answerIndex = parseInt(value, 10);
+    setQuestions(newQuestions);
+  };
+
+  const addQuestion = () => {
+    setQuestions([...questions, { question: "", options: ["", "", "", ""], answerIndex: 0 }]);
+  };
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    try {
+      const token = localStorage.getItem('token');
+      await axios.post('http://localhost:5000/api/quizzes', { title, questions }, {
+        headers: { Authorization: token }
+      });
+      alert('Quiz created successfully!');
+      history.push('/');
+    } catch (err) {
+      console.error(err);
+      alert('Failed to create quiz. Make sure you are logged in as an examiner.');
+    }
+  };
+
+  return (
+    <div>
+      <h2>Create Quiz</h2>
+      <form onSubmit={handleSubmit}>
+        <label>Title:</label><br />
+        <input
+          type="text"
+          value={title}
+          onChange={(e) => setTitle(e.target.value)}
+          required
+        /><br /><br />
+        {questions.map((q, index) => (
+          <div key={index} style={{ marginBottom: "20px", padding: "10px", border: "1px solid #ccc" }}>
+            <label>Question {index + 1}:</label><br />
+            <input
+              type="text"
+              value={q.question}
+              onChange={(e) => handleQuestionChange(index, e.target.value)}
+              required
+            /><br /><br />
+            {q.options.map((option, oIndex) => (
+              <div key={oIndex}>
+                <label>Option {oIndex + 1}:</label>{' '}
+                <input
+                  type="text"
+                  value={option}
+                  onChange={(e) => handleOptionChange(index, oIndex, e.target.value)}
+                  required
+                /><br />
+              </div>
+            ))}
+            <label>Correct Option (0-3):</label>{' '}
+            <input
+              type="number"
+              min="0"
+              max="3"
+              value={q.answerIndex}
+              onChange={(e) => handleAnswerChange(index, e.target.value)}
+              required
+            />
+          </div>
+        ))}
+        <button type="button" onClick={addQuestion}>Add another question</button><br /><br />
+        <button type="submit">Create Quiz</button>
+      </form>
+    </div>
+  );
+}
+
+export default CreateQuiz;
+import React, { useEffect, useState } from 'react';
+import axios from 'axios';
+
+function QuizAttempt({ match }) {
+  const quizId = match.params.quizId;
+  const [quiz, setQuiz] = useState(null);
+  const [answers, setAnswers] = useState([]);
+  const [result, setResult] = useState(null);
+
+  useEffect(() => {
+    // Fetch the quiz details based on the provided quizId
+    axios.get('http://localhost:5000/api/quizzes')
+      .then((res) => {
+        const foundQuiz = res.data.find((q) => q._id === quizId);
+        if (foundQuiz) {
+          setQuiz(foundQuiz);
+          setAnswers(Array(foundQuiz.questions.length).fill(null));
+        }
+      })
+      .catch((err) => console.error(err));
+  }, [quizId]);
+
+  const handleOptionSelect = (qIndex, oIndex) => {
+    const newAnswers = [...answers];
+    newAnswers[qIndex] = oIndex;
+    setAnswers(newAnswers);
+  };
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    try {
+      const res = await axios.post(`http://localhost:5000/api/quizzes/${quizId}/attempt`, { answers });
+      setResult(res.data);
+    } catch (err) {
+      console.error(err);
+      alert('Failed to submit quiz');
+    }
+  };
+
+  if (!quiz) return <div>Loading quiz...</div>;
+
+  return (
+    <div>
+      <h2>{quiz.title}</h2>
+      <form onSubmit={handleSubmit}>
+        {quiz.questions.map((q, qIndex) => (
+          <div key={qIndex} style={{ marginBottom: "15px" }}>
+            <p><strong>{q.question}</strong></p>
+            {q.options.map((option, oIndex) => (
+              <div key={oIndex}>
+                <input
+                  type="radio"
+                  name={`question-${qIndex}`}
+                  value={oIndex}
+                  onChange={() => handleOptionSelect(qIndex, oIndex)}
+                  required
+                />
+                <label>{option}</label>
+              </div>
+            ))}
+          </div>
+        ))}
+        <button type="submit">Submit Quiz</button>
+      </form>
+      {result && (
+        <div style={{ marginTop: "20px", fontWeight: "bold" }}>
+          You scored {result.score} out of {result.total}
+        </div>
+      )}
+    </div>
+  );
+}
+
+export default QuizAttempt;
+
+
+
+
+
+
+
+
+
